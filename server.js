@@ -479,6 +479,16 @@ app.post("/api/incoming", async (req, res) => {
   }, 45 * 1000);
 });
 
+// ─── PROCESS ERROR HANDLERS ──────────────────────────────────────────────────
+process.on("uncaughtException", (err) => {
+  console.error("[CRASH] Uncaught exception:", err.message);
+  console.error(err.stack);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[CRASH] Unhandled rejection:", reason);
+});
+
 // ─── DAILY CRON (09:00 every day) ────────────────────────────────────────────
 cron.schedule("0 9 * * *", async () => {
   console.log("[CRON] Starting daily send...");
