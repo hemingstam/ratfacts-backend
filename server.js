@@ -186,7 +186,7 @@ async function sendWormFact(victim) {
 
 // ─── EMAIL MAGIC LINK ─────────────────────────────────────────────────────────
 async function sendMagicLink(email, token) {
-  const link = `${APP_URL}?token=${token}`;
+  const link = `${APP_URL}/auth/verify?token=${token}`;
   try {
     await resend.emails.send({
       from: process.env.RESEND_FROM_EMAIL || "ratfacts@resend.dev",
@@ -267,9 +267,14 @@ app.post("/api/auth/request", async (req, res) => {
   res.json({ ok: true });
 });
 
-// GET /api/auth/verify?token=xxx — verify magic link
+// GET /api/auth/verify — decoy for email prefetch bots (never marks token used)
 app.get("/api/auth/verify", (req, res) => {
-  const { token } = req.query;
+  res.json({ ok: true, message: "Use POST to verify" });
+});
+
+// POST /api/auth/verify — real verification (email clients never POST, so safe)
+app.post("/api/auth/verify", (req, res) => {
+  const token = req.body.token || req.query.token;
   if (!token) return res.status(400).json({ error: "Token required" });
 
   const links = loadLinks();
