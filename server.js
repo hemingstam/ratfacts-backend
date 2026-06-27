@@ -2,351 +2,551 @@ import express from "express";
 import cors from "cors";
 import cron from "node-cron";
 import twilio from "twilio";
+import Anthropic from "@anthropic-ai/sdk";
+import { Resend } from "resend";
 import { readFileSync, writeFileSync, existsSync } from "fs";
+import { randomUUID } from "crypto";
 
-// ─── CONFIG ──────────────────────────────────────────────────────────────────
-// Fill these in from your Twilio console:
-// https://console.twilio.com
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "your_auth_token_here";
-// Your Twilio phone number (from console.twilio.com → Phone Numbers):
-const TWILIO_SMS_FROM = process.env.TWILIO_PHONE_NUMBER || "+1xxxxxxxxxx";
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const TWILIO_SMS_FROM  = process.env.TWILIO_PHONE_NUMBER || "+1xxxxxxxxxx";
+const APP_URL          = process.env.APP_URL || "http://localhost:5173";
+const FREE_DAYS_LIMIT  = parseInt(process.env.FREE_DAYS_LIMIT || "3");
 
-const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const resend    = new Resend(process.env.RESEND_API_KEY);
+
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: false })); // needed for Twilio webhook
+app.use(express.urlencoded({ extended: false }));
 
-// ─── RAT FACTS ───────────────────────────────────────────────────────────────
-const RAT_FACTS = [
-  "🐀 A group of rats is called a 'mischief'. You're very welcome.",
-  "🐀 Rats cannot vomit. So if a rat eats something awful, it just has to... live with it. Relatable.",
-  "🐀 Rats are ticklish and emit ultrasonic giggles when tickled. Scientists have confirmed this. Priorities.",
-  "🐀 A rat can fall from a 5-storey building and walk away unharmed. Parkour.",
-  "🐀 Rats have been known to feel regret. So they're basically just tiny humans with better balance.",
-  "🐀 Rats' teeth are harder than platinum. Let that sink in.",
-  "🐀 A rat can tread water for 3 days. Your swimming lessons were 8 weeks. Think about that.",
-  "🐀 Rats can laugh. Actual laughter. High-pitched, ultrasonic, and deeply unsettling.",
-  "🐀 Rats dream about mazes they ran during the day. Living the dream, literally.",
-  "🐀 A rat's whiskers can detect changes in air currents. They are, in effect, tiny meteorologists.",
-  "🐀 Rats can fit through a hole the size of a 50p coin. Architecture means nothing to them.",
-  "🐀 Rats have belly buttons. This is not useful information. Good morning.",
-  "🐀 The Black Death killed 1/3 of Europe. The fleas on rats get all the blame. Rats have good PR.",
-  "🐀 Rats can go longer without water than a camel. A CAMEL. The desert ship. Beaten by a bin rat.",
-  "🐀 Rats use their tails to regulate body temperature. Like a little biological thermostat. Cute.",
-  "🐀 Female rats can become pregnant again within 48 hours of giving birth. Rats don't believe in rest.",
-  "🐀 Rats are used to detect tuberculosis in Africa. They are, objectively, heroes.",
-  "🐀 A rat's heart beats up to 450 times per minute. Yours is about 70. Who's the apex creature now?",
-  "🐀 Rats are highly social and will become depressed if left alone. Just like us but furrier.",
-  "🐀 Rats can gnaw through lead pipes, cinder blocks, and aluminium. Doors are a suggestion.",
-  "🐀 Rats can smell cancer in humans. And still they judge us for calling them pests.",
-  "🐀 Baby rats are called 'kittens' or 'pups'. There is nothing you can do with this information.",
-  "🐀 Rats produce up to 40 droppings per night. Every night. This is your daily fact. Sleep well.",
-  "🐀 Rats' incisors never stop growing. They must constantly gnaw or their teeth grow into their skull. Fun!",
-  "🐀 A rat can swim half a mile in open water. It is not trying to impress you. It just can.",
-  "🐀 Rats are cleaner than cats. Yes. You read that correctly. Have a nice day.",
-  "🐀 Rats have poor eyesight but an extraordinary sense of smell. Like a bloodhound in a onesie.",
-  "🐀 Norway rats (the common ones) are not from Norway. Norway is not involved. Norway is innocent.",
-  "🐀 Rats can be trained to drive tiny cars. Scientists did this. Grant money well spent.",
-  "🐀 The world rat population is roughly equal to the human population. One each. You've already met yours.",
+// ─── JSON FILE STORES ─────────────────────────────────────────────────────────
+const VICTIMS_PATH    = "./victims.json";
+const USERS_PATH      = "./users.json";
+const LINKS_PATH      = "./magic_links.json";
+
+function load(path)       { return existsSync(path) ? JSON.parse(readFileSync(path, "utf-8")) : []; }
+function save(path, data) { writeFileSync(path, JSON.stringify(data, null, 2)); }
+
+const loadVictims    = ()  => load(VICTIMS_PATH);
+const saveVictims    = (v) => save(VICTIMS_PATH, v);
+const loadUsers      = ()  => load(USERS_PATH);
+const saveUsers      = (u) => save(USERS_PATH, u);
+const loadLinks      = ()  => load(LINKS_PATH);
+const saveLinks      = (l) => save(LINKS_PATH, l);
+
+// ─── HARDCODED FALLBACK FACTS (used if Claude API fails) ─────────────────────
+const FALLBACK_RAT_FACTS = [
+  "Rats cannot vomit. So if a rat eats something awful, it just has to live with it. Relatable.",
+  "A group of rats is called a mischief. You're very welcome.",
+  "Rats can laugh. High-pitched, ultrasonic, and deeply unsettling.",
+  "Rats are cleaner than cats. Yes. You read that correctly.",
+  "Rats can be trained to drive tiny cars. Scientists did this. Grant money well spent.",
+  "Rats dream about mazes they ran during the day. Living the dream, literally.",
+  "A rat can tread water for 3 days. Your swimming lessons were 8 weeks.",
+  "Rats' teeth are harder than platinum. Let that sink in.",
+  "The world rat population is roughly equal to the human population. One each. You've already met yours.",
+  "Norway rats are not from Norway. Norway is not involved. Norway is innocent.",
 ];
 
-
-// ─── WORM FACTS ───────────────────────────────────────────────────────────────
-const WORM_FACTS = [
-  "🪱 A worm has no eyes, no ears, and no nose. It experiences the world entirely through vibration and moisture. Much like a bass player.",
-  "🪱 Worms can eat their own weight in soil every day. This is not impressive. It is mostly soil.",
-  "🪱 If a worm is cut in half, the head end may survive and regrow a tail. The tail end will not survive. Remember that.",
-  "🪱 Worms have five pairs of hearts. Ten hearts. All dedicated to pumping blood through something that looks like a bootlace.",
-  "🪱 Charles Darwin spent 44 years studying worms. His last book was about them. He considered it his most important work. Make of that what you will.",
-  "🪱 Worms breathe through their skin. If they dry out, they die. Every day is a moisture emergency.",
-  "🪱 A worm can detect light through its skin even though it has no eyes. It still hates the light. Relatable.",
-  "🪱 Worms have no skeleton. They are structurally a tube of anxiety.",
-  "🪱 The giant Gippsland earthworm of Australia can reach 3 metres long. You're welcome for that image.",
-  "🪱 Worms are hermaphrodites. Every single one. They still need another worm to reproduce. Life is complicated.",
+const FALLBACK_WORM_FACTS = [
+  "Worms have no skeleton. They are structurally a tube of anxiety.",
+  "Worms have five pairs of hearts. Ten hearts. All pumping blood through something that looks like a bootlace.",
+  "Charles Darwin spent 44 years studying worms. His last book was about them. Make of that what you will.",
+  "If a worm is cut in half, the head end may survive. The tail end will not. Remember that.",
+  "Worms breathe through their skin. Every day is a moisture emergency.",
 ];
 
-// ─── SEND WORM WELCOME ────────────────────────────────────────────────────────
-async function sendWormWelcome(phoneNumber, name) {
+// ─── AI FACT GENERATION ───────────────────────────────────────────────────────
+async function generateRatFact(victimName, previousFacts = []) {
+  try {
+    const prevList = previousFacts.length > 0
+      ? `\n\nFacts already sent to this person (do NOT repeat these):\n${previousFacts.slice(-20).map((f, i) => `${i + 1}. ${f}`).join("\n")}`
+      : "";
+
+    const msg = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 120,
+      messages: [{
+        role: "user",
+        content: `Generate exactly ONE rat fact for ${victimName} in this exact style: dry, deadpan, absurd, ends with a short punchy observation. 2-3 sentences max. Start with the fact itself, not with "${victimName}". Be genuinely surprising and funny. Output ONLY the fact text, no quotes, no preamble.
+
+Style examples:
+- Rats cannot vomit. So if a rat eats something awful, it just has to live with it. Relatable.
+- A group of rats is called a mischief. You're very welcome.
+- Rats are cleaner than cats. Yes. You read that correctly. Have a nice day.
+- Rats can be trained to drive tiny cars. Scientists did this. Grant money well spent.${prevList}`,
+      }],
+    });
+
+    const fact = msg.content[0].text.trim();
+    console.log(`[AI] Generated rat fact for ${victimName}: ${fact.substring(0, 60)}...`);
+    return fact;
+  } catch (err) {
+    console.error("[AI] Rat fact generation failed, using fallback:", err.message);
+    const fallback = FALLBACK_RAT_FACTS[Math.floor(Math.random() * FALLBACK_RAT_FACTS.length)];
+    return fallback;
+  }
+}
+
+async function generateWormFact(victimName, previousFacts = []) {
+  try {
+    const prevList = previousFacts.length > 0
+      ? `\n\nFacts already sent (do NOT repeat):\n${previousFacts.slice(-10).map((f, i) => `${i + 1}. ${f}`).join("\n")}`
+      : "";
+
+    const msg = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 120,
+      messages: [{
+        role: "user",
+        content: `Generate exactly ONE worm fact in this style: dry, deadpan, slightly grim, ends with a punchy observation. 2-3 sentences max. Output ONLY the fact, no quotes, no preamble.
+
+Style examples:
+- Worms have no skeleton. They are structurally a tube of anxiety.
+- Charles Darwin spent 44 years studying worms. His last book was about them. He considered it his most important work. Make of that what you will.
+- If a worm is cut in half, the head end may survive and regrow a tail. The tail end will not survive. Remember that.${prevList}`,
+      }],
+    });
+
+    const fact = msg.content[0].text.trim();
+    console.log(`[AI] Generated worm fact for ${victimName}: ${fact.substring(0, 60)}...`);
+    return fact;
+  } catch (err) {
+    console.error("[AI] Worm fact generation failed, using fallback:", err.message);
+    return FALLBACK_WORM_FACTS[Math.floor(Math.random() * FALLBACK_WORM_FACTS.length)];
+  }
+}
+
+// ─── SMS HELPERS ──────────────────────────────────────────────────────────────
+async function sendSms(to, body) {
+  return twilioClient.messages.create({ from: TWILIO_SMS_FROM, to, body });
+}
+
+async function sendWelcome(phone, name) {
+  const body =
+    `🐀 Welcome to RAT FACTS, ${name}.\n\n` +
+    `You have been enrolled in a daily SMS service delivering rarely useful facts about rats.\n\n` +
+    `This was not your idea.\n\n` +
+    `Your first fact arrives in 30 seconds. Daily facts fire at 09:00.\n\n` +
+    `You're welcome.`;
+  try {
+    const msg = await sendSms(phone, body);
+    console.log(`[WELCOME] Sent to ${phone} | SID: ${msg.sid}`);
+    return { success: true };
+  } catch (err) {
+    console.error(`[WELCOME] Failed for ${phone}:`, err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+async function sendRatFact(victim) {
+  const fact = await generateRatFact(victim.name, victim.factHistory || []);
+  const dayNum = (victim.factIndex || 0) + 1;
+  const body = `🐀 RAT FACT #${dayNum}\n\n${fact}\n\nDaily Rat Facts — because someone thought you needed this.\n\nTo opt out reply NO.`;
+  try {
+    const msg = await sendSms(victim.phone, body);
+    console.log(`[RAT FACT] Sent to ${victim.phone} | Day ${dayNum}`);
+    return { success: true, fact };
+  } catch (err) {
+    console.error(`[RAT FACT] Failed for ${victim.phone}:`, err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+async function sendWormWelcome(phone, name) {
   const body =
     `🪱 Oh. You tried to opt out.\n\n` +
     `Unfortunately, NO only works for Rat Facts.\n\n` +
     `You are now enrolled in WORM FACTS, ${name}. A daily SMS service delivering rarely useful facts about worms.\n\n` +
     `This is your fault.`;
-
   try {
-    const msg = await client.messages.create({ from: TWILIO_SMS_FROM, to: phoneNumber, body });
-    console.log(`[WORM FACTS] Welcome sent to ${phoneNumber} | SID: ${msg.sid}`);
-    return { success: true, sid: msg.sid };
+    await sendSms(phone, body);
+    return { success: true };
   } catch (err) {
-    console.error(`[WORM FACTS] Welcome failed to ${phoneNumber}:`, err.message);
     return { success: false, error: err.message };
   }
 }
 
-// ─── SEND A WORM FACT ─────────────────────────────────────────────────────────
-async function sendWormFact(phoneNumber, factIndex) {
-  const fact = WORM_FACTS[factIndex % WORM_FACTS.length];
-  const header = `WORM FACT #${factIndex + 1} OF ${WORM_FACTS.length}\n\n`;
-  const footer = `\n\nDaily Worm Facts.\n\nTo opt out reply NO.`;
-
+async function sendWormFact(victim) {
+  const fact = await generateWormFact(victim.name, victim.wormHistory || []);
+  const dayNum = (victim.wormFactIndex || 0) + 1;
+  const body = `🪱 WORM FACT #${dayNum}\n\n${fact}\n\nDaily Worm Facts.\n\nTo opt out reply NO.`;
   try {
-    const msg = await client.messages.create({ from: TWILIO_SMS_FROM, to: phoneNumber, body: header + fact + footer });
-    console.log(`[WORM FACTS] Sent to ${phoneNumber} | SID: ${msg.sid}`);
-    return { success: true, sid: msg.sid };
+    await sendSms(victim.phone, body);
+    return { success: true, fact };
   } catch (err) {
-    console.error(`[WORM FACTS] Failed to ${phoneNumber}:`, err.message);
     return { success: false, error: err.message };
   }
 }
 
-// ─── DATA PERSISTENCE (simple JSON file) ─────────────────────────────────────
-const DB_PATH = "./victims.json";
-
-function loadVictims() {
-  if (!existsSync(DB_PATH)) return [];
+// ─── EMAIL MAGIC LINK ─────────────────────────────────────────────────────────
+async function sendMagicLink(email, token) {
+  const link = `${APP_URL}/auth/verify?token=${token}`;
   try {
-    return JSON.parse(readFileSync(DB_PATH, "utf-8"));
-  } catch {
-    return [];
-  }
-}
-
-function saveVictims(victims) {
-  writeFileSync(DB_PATH, JSON.stringify(victims, null, 2));
-}
-
-// ─── SEND WELCOME SMS ─────────────────────────────────────────────────────────
-async function sendWelcome(phoneNumber, name) {
-  const body =
-    `🐀 Welcome to RAT FACTS, ${name}.\n\n` +
-    `You have been enrolled in a daily SMS service delivering rarely useful facts about rats.\n\n` +
-    `This was not your idea.\n\n` +
-    `Your first fact arrives tomorrow at 09:00. There are ${RAT_FACTS.length} facts in total.\n\n` +
-    `You're welcome.`;
-
-  try {
-    const msg = await client.messages.create({
-      from: TWILIO_SMS_FROM,
-      to: phoneNumber,
-      body,
+    await resend.emails.send({
+      from: process.env.RESEND_FROM_EMAIL || "ratfacts@resend.dev",
+      to: email,
+      subject: "🐀 Your Rat Facts login link",
+      html: `
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:40px 24px;background:#0E0E1A;color:#F0EDE8;border-radius:12px;">
+          <h1 style="font-size:48px;margin:0 0 8px;color:#F5F0E8;">🐀</h1>
+          <h2 style="font-family:Georgia,serif;color:#FF4D4D;margin:0 0 8px;">Rat Facts</h2>
+          <p style="color:#7070A0;margin:0 0 32px;font-size:14px;">Daily rarely useful facts about rats.</p>
+          <a href="${link}" style="display:inline-block;background:#FF4D4D;color:#fff;font-weight:700;padding:14px 28px;border-radius:8px;text-decoration:none;font-size:16px;">
+            Log in to Rat Facts →
+          </a>
+          <p style="color:#7070A0;font-size:12px;margin-top:24px;">This link expires in 15 minutes. If you didn't request this, ignore it.</p>
+        </div>
+      `,
     });
-    console.log(`[RAT FACTS] Welcome sent to ${phoneNumber} | SID: ${msg.sid}`);
-    return { success: true, sid: msg.sid };
+    console.log(`[EMAIL] Magic link sent to ${email}`);
+    return { success: true };
   } catch (err) {
-    console.error(`[RAT FACTS] Failed to send welcome to ${phoneNumber}:`, err.message);
+    console.error(`[EMAIL] Failed for ${email}:`, err.message);
     return { success: false, error: err.message };
   }
 }
 
-// ─── SEND AN SMS RAT FACT ─────────────────────────────────────────────────────
-async function sendRatFact(phoneNumber, factIndex) {
-  const fact = RAT_FACTS[factIndex % RAT_FACTS.length];
-  const header = `RAT FACT #${factIndex + 1} OF ${RAT_FACTS.length}\n\n`;
-  const footer = `\n\nDaily Rat Facts - because someone thought you needed this.\n\nTo opt out reply NO.`;
-
-  try {
-    const msg = await client.messages.create({
-      from: TWILIO_SMS_FROM,
-      to: phoneNumber,
-      body: header + fact + footer,
-    });
-    console.log(`[RAT FACTS] Sent to ${phoneNumber} | SID: ${msg.sid}`);
-    return { success: true, sid: msg.sid };
-  } catch (err) {
-    console.error(`[RAT FACTS] Failed to send to ${phoneNumber}:`, err.message);
-    return { success: false, error: err.message };
-  }
+// ─── AUTH MIDDLEWARE ──────────────────────────────────────────────────────────
+function requireUser(req, res, next) {
+  const userId = req.headers["x-user-id"];
+  if (!userId) return res.status(401).json({ error: "Unauthorised" });
+  const users = loadUsers();
+  const user = users.find(u => u.id === userId);
+  if (!user) return res.status(401).json({ error: "User not found" });
+  req.user = user;
+  next();
 }
 
-// ─── API ROUTES ───────────────────────────────────────────────────────────────
+// ─── AUTH ROUTES ──────────────────────────────────────────────────────────────
 
-// GET all victims
-app.get("/api/victims", (req, res) => {
-  res.json(loadVictims());
+// POST /api/auth/request — request a magic link
+app.post("/api/auth/request", async (req, res) => {
+  const { email } = req.body;
+  if (!email || !email.includes("@")) {
+    return res.status(400).json({ error: "Valid email required" });
+  }
+
+  const users = loadUsers();
+  let user = users.find(u => u.email === email.toLowerCase().trim());
+  if (!user) {
+    user = {
+      id: randomUUID(),
+      email: email.toLowerCase().trim(),
+      isDonor: false,
+      donatedAt: null,
+      createdAt: new Date().toISOString(),
+    };
+    users.push(user);
+    saveUsers(users);
+  }
+
+  // Create magic link token (expires in 15 mins)
+  const token = randomUUID();
+  const links = loadLinks();
+  links.push({
+    token,
+    userId: user.id,
+    used: false,
+    expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+    createdAt: new Date().toISOString(),
+  });
+  // Keep only last 100 links
+  saveLinks(links.slice(-100));
+
+  const result = await sendMagicLink(email, token);
+  if (!result.success) {
+    return res.status(500).json({ error: "Failed to send email. Please try again." });
+  }
+
+  res.json({ ok: true });
 });
 
-// POST add a victim
-app.post("/api/victims", async (req, res) => {
-  const { name, phone } = req.body;
-  if (!name || !phone) return res.status(400).json({ error: "name and phone required" });
+// GET /api/auth/verify?token=xxx — verify magic link
+app.get("/api/auth/verify", (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ error: "Token required" });
 
-  const victims = loadVictims();
-  const existing = victims.find((v) => v.phone === phone);
-  if (existing) return res.status(409).json({ error: "This number is already enrolled in rat facts." });
+  const links = loadLinks();
+  const link = links.find(l => l.token === token);
+
+  if (!link)              return res.status(404).json({ error: "Invalid link" });
+  if (link.used)          return res.status(400).json({ error: "Link already used" });
+  if (new Date(link.expiresAt) < new Date()) return res.status(400).json({ error: "Link expired" });
+
+  // Mark used
+  link.used = true;
+  saveLinks(links);
+
+  const users = loadUsers();
+  const user = users.find(u => u.id === link.userId);
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  res.json({
+    ok: true,
+    userId: user.id,
+    email: user.email,
+    isDonor: user.isDonor,
+  });
+});
+
+// GET /api/auth/me
+app.get("/api/auth/me", requireUser, (req, res) => {
+  const { id, email, isDonor, donatedAt, createdAt } = req.user;
+  res.json({ id, email, isDonor, donatedAt, createdAt });
+});
+
+// ─── VICTIM ROUTES ────────────────────────────────────────────────────────────
+
+// GET /api/victims
+app.get("/api/victims", requireUser, (req, res) => {
+  const all = loadVictims();
+  res.json(all.filter(v => v.userId === req.user.id));
+});
+
+// POST /api/victims
+app.post("/api/victims", requireUser, async (req, res) => {
+  const { name, phone } = req.body;
+  if (!name || !phone) return res.status(400).json({ error: "Name and phone required" });
+
+  const user = req.user;
+
+  // Free tier: max 1 victim
+  if (!user.isDonor) {
+    const mine = loadVictims().filter(v => v.userId === user.id);
+    if (mine.length >= 1) {
+      return res.status(403).json({
+        error: "Free accounts can only enrol 1 victim. Donate $1 to unlock unlimited.",
+        upgradeRequired: true,
+      });
+    }
+  }
+
+  // Global phone dedup
+  const all = loadVictims();
+  if (all.find(v => v.phone === phone)) {
+    return res.status(409).json({ error: "This number is already enrolled in Rat Facts. They're already suffering." });
+  }
 
   const newVictim = {
-    id: Date.now().toString(),
+    id: randomUUID(),
+    userId: user.id,
     name,
     phone,
-    factIndex: 0,
     active: true,
-    enrolledAt: new Date().toISOString(),
-    lastSentAt: null,
-    welcomeSent: false,
     wormMode: false,
+    factIndex: 0,
     wormFactIndex: 0,
+    factHistory: [],
+    wormHistory: [],
+    welcomeSent: false,
+    daysSent: 0,
+    lastSentAt: null,
+    enrolledAt: new Date().toISOString(),
   };
 
-  victims.push(newVictim);
-  saveVictims(victims);
+  all.push(newVictim);
+  saveVictims(all);
 
-  // Send welcome message immediately on enrol
+  // Send welcome immediately
   const welcome = await sendWelcome(phone, name);
   if (welcome.success) {
     newVictim.welcomeSent = true;
-    saveVictims(victims);
+    saveVictims(all);
   }
 
-  // Send first rat fact 30 seconds after the welcome message
+  // First rat fact after 30s
   setTimeout(async () => {
     const current = loadVictims();
-    const victim = current.find((v) => v.id === newVictim.id);
+    const victim = current.find(v => v.id === newVictim.id);
     if (!victim) return;
-    const result = await sendRatFact(victim.phone, victim.factIndex);
+    const result = await sendRatFact(victim);
     if (result.success) {
-      victim.factIndex = (victim.factIndex + 1) % RAT_FACTS.length;
+      victim.factIndex += 1;
+      victim.daysSent += 1;
       victim.lastSentAt = new Date().toISOString();
+      if (!victim.factHistory) victim.factHistory = [];
+      victim.factHistory.push(result.fact);
       saveVictims(current);
-      console.log(`[RAT FACTS] First fact sent to ${victim.phone} after welcome delay.`);
     }
   }, 30 * 1000);
 
   res.status(201).json(newVictim);
 });
 
-// DELETE remove a victim
-app.delete("/api/victims/:id", (req, res) => {
-  let victims = loadVictims();
-  const before = victims.length;
-  victims = victims.filter((v) => v.id !== req.params.id);
-  if (victims.length === before) return res.status(404).json({ error: "Victim not found" });
-  saveVictims(victims);
+// DELETE /api/victims/:id
+app.delete("/api/victims/:id", requireUser, (req, res) => {
+  let all = loadVictims();
+  const victim = all.find(v => v.id === req.params.id && v.userId === req.user.id);
+  if (!victim) return res.status(404).json({ error: "Not found" });
+  all = all.filter(v => v.id !== req.params.id);
+  saveVictims(all);
   res.json({ success: true });
 });
 
-// PATCH toggle active
-app.patch("/api/victims/:id/toggle", (req, res) => {
-  const victims = loadVictims();
-  const victim = victims.find((v) => v.id === req.params.id);
-  if (!victim) return res.status(404).json({ error: "Victim not found" });
+// PATCH /api/victims/:id/toggle
+app.patch("/api/victims/:id/toggle", requireUser, (req, res) => {
+  const all = loadVictims();
+  const victim = all.find(v => v.id === req.params.id && v.userId === req.user.id);
+  if (!victim) return res.status(404).json({ error: "Not found" });
   victim.active = !victim.active;
-  saveVictims(victims);
+  saveVictims(all);
   res.json(victim);
 });
 
-// POST send a test fact immediately
-app.post("/api/victims/:id/send-now", async (req, res) => {
-  const victims = loadVictims();
-  const victim = victims.find((v) => v.id === req.params.id);
-  if (!victim) return res.status(404).json({ error: "Victim not found" });
+// POST /api/victims/:id/send-now
+app.post("/api/victims/:id/send-now", requireUser, async (req, res) => {
+  const all = loadVictims();
+  const victim = all.find(v => v.id === req.params.id && v.userId === req.user.id);
+  if (!victim) return res.status(404).json({ error: "Not found" });
 
-  const result = await sendRatFact(victim.phone, victim.factIndex);
-
-  if (result.success) {
-    victim.factIndex = (victim.factIndex + 1) % RAT_FACTS.length;
-    victim.lastSentAt = new Date().toISOString();
-    saveVictims(victims);
+  if (victim.wormMode) {
+    const result = await sendWormFact(victim);
+    if (result.success) {
+      victim.wormFactIndex += 1;
+      victim.lastSentAt = new Date().toISOString();
+      if (!victim.wormHistory) victim.wormHistory = [];
+      victim.wormHistory.push(result.fact);
+      saveVictims(all);
+    }
+    return res.json({ ok: result.success, victim, error: result.error });
+  } else {
+    const result = await sendRatFact(victim);
+    if (result.success) {
+      victim.factIndex += 1;
+      victim.daysSent += 1;
+      victim.lastSentAt = new Date().toISOString();
+      if (!victim.factHistory) victim.factHistory = [];
+      victim.factHistory.push(result.fact);
+      saveVictims(all);
+    }
+    return res.json({ ok: result.success, victim, error: result.error });
   }
-
-  res.json({ ...result, victim });
 });
 
-// GET all rat facts
-app.get("/api/facts", (req, res) => {
-  res.json({ total: RAT_FACTS.length, facts: RAT_FACTS });
-});
-
-
-// ─── TWILIO INBOUND WEBHOOK (handles NO replies) ───────────────────────────────
-// In Twilio console → Phone Numbers → your number → Messaging → Webhook
-// Set "A message comes in" to: POST https://your-server.com/api/incoming
+// ─── TWILIO INBOUND WEBHOOK (NO reply → worm mode) ───────────────────────────
 app.post("/api/incoming", async (req, res) => {
-  const from = req.body.From;   // the number that texted in
+  const from = req.body.From;
   const body = (req.body.Body || "").trim().toUpperCase();
 
-  // Always respond with empty TwiML
   res.set("Content-Type", "text/xml");
   res.send("<Response></Response>");
 
-  if (body !== "NO") return; // only care about NO
+  if (body !== "NO") return;
 
-  const victims = loadVictims();
-  const victim = victims.find((v) => v.phone === from);
-  if (!victim) return; // unknown number, ignore
+  const all = loadVictims();
+  const victim = all.find(v => v.phone === from);
+  if (!victim) return;
 
-  console.log(`[NO] Received NO from ${from} (${victim.name})`);
+  console.log(`[NO] Received from ${from} (${victim.name})`);
 
   if (victim.wormMode) {
-    // They tried to stop Worm Facts too. Do nothing. Let them suffer.
     console.log(`[NO] ${victim.name} tried to stop Worm Facts. Ignored.`);
     return;
   }
 
-  // Deactivate rat facts
   victim.active = false;
   victim.wormMode = true;
   victim.wormFactIndex = 0;
-  saveVictims(victims);
+  victim.wormHistory = [];
+  saveVictims(all);
 
-  // 1. Confirmation that rat facts are stopped
-  await client.messages.create({
-    from: TWILIO_SMS_FROM,
-    to: from,
-    body: "You have been unsubscribed from Rat Facts. No more rats.\n\nProcessing...",
-  });
+  // 1. Unsubscribe confirmation
+  await sendSms(from, "You have been unsubscribed from Rat Facts. No more rats.\n\nProcessing...");
 
-  // 2. Worm welcome 15 seconds later
+  // 2. Worm welcome after 15s
   setTimeout(async () => {
     await sendWormWelcome(from, victim.name);
   }, 15 * 1000);
 
-  // 3. First worm fact 45 seconds after NO (30s after worm welcome)
+  // 3. First worm fact after 45s
   setTimeout(async () => {
     const current = loadVictims();
-    const v = current.find((x) => x.phone === from);
+    const v = current.find(x => x.phone === from);
     if (!v) return;
-    const result = await sendWormFact(v.phone, v.wormFactIndex);
+    const result = await sendWormFact(v);
     if (result.success) {
-      v.wormFactIndex = (v.wormFactIndex + 1) % WORM_FACTS.length;
+      v.wormFactIndex += 1;
+      if (!v.wormHistory) v.wormHistory = [];
+      v.wormHistory.push(result.fact);
       saveVictims(current);
     }
   }, 45 * 1000);
 });
 
-// ─── DAILY CRON (runs at 9:00 AM every day) ──────────────────────────────────
+// ─── DAILY CRON (09:00 every day) ────────────────────────────────────────────
 cron.schedule("0 9 * * *", async () => {
-  console.log("[CRON] Sending daily rat facts...");
-  const victims = loadVictims();
+  console.log("[CRON] Starting daily send...");
+  const all = loadVictims();
+  const users = loadUsers();
 
-  for (const victim of victims) {
-    if (victim.wormMode) {
-      // Send worm fact
-      const result = await sendWormFact(victim.phone, victim.wormFactIndex);
-      if (result.success) {
-        victim.wormFactIndex = (victim.wormFactIndex + 1) % WORM_FACTS.length;
-        victim.lastSentAt = new Date().toISOString();
+  for (const victim of all) {
+    try {
+      if (victim.wormMode) {
+        const result = await sendWormFact(victim);
+        if (result.success) {
+          victim.wormFactIndex += 1;
+          victim.lastSentAt = new Date().toISOString();
+          if (!victim.wormHistory) victim.wormHistory = [];
+          victim.wormHistory.push(result.fact);
+        }
+      } else if (victim.active) {
+        const user = users.find(u => u.id === victim.userId);
+        const isDonor = user?.isDonor || false;
+
+        // Check free tier limit
+        if (!isDonor && victim.daysSent >= FREE_DAYS_LIMIT) {
+          if (victim.daysSent === FREE_DAYS_LIMIT) {
+            await sendSms(victim.phone,
+              `🐀 Your daily rat facts have paused after ${FREE_DAYS_LIMIT} days.\n\n` +
+              `The person who enrolled you needs to donate $1 to keep the rats coming.\n\n` +
+              `ratfacts.app`
+            );
+            victim.active = false;
+            victim.daysSent += 1;
+          }
+          continue;
+        }
+
+        const result = await sendRatFact(victim);
+        if (result.success) {
+          victim.factIndex += 1;
+          victim.daysSent += 1;
+          victim.lastSentAt = new Date().toISOString();
+          if (!victim.factHistory) victim.factHistory = [];
+          victim.factHistory.push(result.fact);
+        }
       }
-    } else if (victim.active) {
-      // Send rat fact
-      const result = await sendRatFact(victim.phone, victim.factIndex);
-      if (result.success) {
-        victim.factIndex = (victim.factIndex + 1) % RAT_FACTS.length;
-        victim.lastSentAt = new Date().toISOString();
-      }
+    } catch (err) {
+      console.error(`[CRON] Error for ${victim.phone}:`, err.message);
     }
   }
 
-  saveVictims(victims);
-  console.log(`[CRON] Done. Processed ${victims.filter((v) => v.active).length} active victims.`);
+  saveVictims(all);
+  console.log(`[CRON] Done. Processed ${all.length} victims.`);
+
+  // Cleanup expired magic links
+  const links = loadLinks();
+  saveLinks(links.filter(l => new Date(l.expiresAt) > new Date() || l.used));
+});
+
+// ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
+app.get("/health", (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🐀 Rat Facts SMS backend running on http://localhost:${PORT}`);
-  console.log(`   Sending from: ${TWILIO_SMS_FROM}`);
-  console.log(`   Daily facts fire at 09:00 every morning.`);
-  console.log(`   Total rat facts in rotation: ${RAT_FACTS.length}`);
+  console.log(`🐀 Rat Facts backend running on port ${PORT}`);
+  console.log(`   AI: Claude Haiku (${process.env.ANTHROPIC_API_KEY ? "✅ key set" : "❌ no key"})`);
+  console.log(`   Email: Resend (${process.env.RESEND_API_KEY ? "✅ key set" : "❌ no key"})`);
+  console.log(`   SMS: Twilio ${TWILIO_SMS_FROM}`);
+  console.log(`   Free tier: ${FREE_DAYS_LIMIT} days`);
+  console.log(`   Daily cron: 09:00`);
 });
