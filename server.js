@@ -11,6 +11,7 @@ import { randomUUID } from "crypto";
 const TWILIO_SMS_FROM  = process.env.TWILIO_PHONE_NUMBER || "+1xxxxxxxxxx";
 const APP_URL          = process.env.APP_URL || "http://localhost:5173";
 const FREE_DAYS_LIMIT  = parseInt(process.env.FREE_DAYS_LIMIT || "3");
+const WORM_DAYS_LIMIT  = parseInt(process.env.WORM_DAYS_LIMIT || "7");
 
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
@@ -349,6 +350,7 @@ app.post("/api/victims", requireUser, async (req, res) => {
     wormFactIndex: 0,
     factHistory: [],
     wormHistory: [],
+    wormDaysSent: 0,
     welcomeSent: false,
     daysSent: 0,
     lastSentAt: null,
@@ -455,9 +457,25 @@ app.post("/api/incoming", async (req, res) => {
     return;
   }
 
+  // Check if the enrolling user is a donor — worm facts are donor-only
+  const users = loadUsers();
+  const enrollingUser = users.find(u => u.id === victim.userId);
+  const isDonor = enrollingUser?.isDonor || false;
+
   victim.active = false;
+  saveVictims(all);
+
+  if (!isDonor) {
+    // Non-donor: just unsubscribe cleanly, no worms
+    await sendSms(from, "You have been unsubscribed from Rat Facts. No more rats.\n\nHave a nice day.");
+    console.log(`[NO] ${victim.name} unsubscribed (non-donor — no worm facts)`);
+    return;
+  }
+
+  // Donor: full worm mode activated
   victim.wormMode = true;
   victim.wormFactIndex = 0;
+  victim.wormDaysSent = 0;
   victim.wormHistory = [];
   saveVictims(all);
 
@@ -477,6 +495,7 @@ app.post("/api/incoming", async (req, res) => {
     const result = await sendWormFact(v);
     if (result.success) {
       v.wormFactIndex += 1;
+      v.wormDaysSent = 1;
       if (!v.wormHistory) v.wormHistory = [];
       v.wormHistory.push(result.fact);
       saveVictims(current);
@@ -494,60 +513,142 @@ process.on("unhandledRejection", (reason) => {
   console.error("[CRASH] Unhandled rejection:", reason);
 });
 
-// ─── DAILY CRON (09:00 every day) ────────────────────────────────────────────
+// ─── WORM SEND HELPER ────────────────────────────────────────────────────────
+async function processWormVictims(all) {
+  for (const victim of all) {
+    if (!victim.wormMode) continue;
+    try {
+      const daysSent = victim.wormDaysSent || 0;
+
+      // 7 days × 2 facts = 14 total worm facts
+      if (daysSent >= WORM_DAYS_LIMIT * 2) {
+        // Already finished — skip silently
+        continue;
+      }
+
+      // On the last send (fact 14), send release message after
+      const isLastFact = daysSent === (WORM_DAYS_LIMIT * 2) - 1;
+
+      const result = await sendWormFact(victim);
+      if (result.success) {
+        victim.wormFactIndex += 1;
+        victim.wormDaysSent = (victim.wormDaysSent || 0) + 1;
+        victim.lastSentAt = new Date().toISOString();
+        if (!victim.wormHistory) victim.wormHistory = [];
+        victim.wormHistory.push(result.fact);
+      }
+
+      // After the final worm fact, send release message and deactivate
+      if (isLastFact && result.success) {
+        setTimeout(async () => {
+          await sendSms(victim.phone,
+            `🪱 You have completed your sentence.
+
+` +
+            `14 worm facts. 7 days. You survived.
+
+` +
+            `The worms are gone.
+
+` +
+            `For now.`
+          );
+          const current = loadVictims();
+          const v = current.find(x => x.id === victim.id);
+          if (v) {
+            v.wormMode = false;
+            v.active = false;
+            saveVictims(current);
+          }
+        }, 30 * 1000);
+      }
+    } catch (err) {
+      console.error(`[WORM CRON] Error for ${victim.phone}:`, err.message);
+    }
+  }
+}
+
+// ─── CRON: 09:00 — rat facts + morning worm facts ────────────────────────────
 cron.schedule("0 9 * * *", async () => {
-  console.log("[CRON] Starting daily send...");
+  console.log("[CRON 09:00] Starting morning send...");
   const all = loadVictims();
   const users = loadUsers();
 
   for (const victim of all) {
+    if (victim.wormMode) continue; // handled below
+    if (!victim.active) continue;
     try {
-      if (victim.wormMode) {
-        const result = await sendWormFact(victim);
-        if (result.success) {
-          victim.wormFactIndex += 1;
-          victim.lastSentAt = new Date().toISOString();
-          if (!victim.wormHistory) victim.wormHistory = [];
-          victim.wormHistory.push(result.fact);
-        }
-      } else if (victim.active) {
-        const user = users.find(u => u.id === victim.userId);
-        const isDonor = user?.isDonor || false;
+      const user = users.find(u => u.id === victim.userId);
+      const isDonor = user?.isDonor || false;
 
-        // Check free tier limit
-        if (!isDonor && victim.daysSent >= FREE_DAYS_LIMIT) {
-          if (victim.daysSent === FREE_DAYS_LIMIT) {
-            await sendSms(victim.phone,
-              `🐀 Your daily rat facts have paused after ${FREE_DAYS_LIMIT} days.\n\n` +
-              `The person who enrolled you needs to donate $1 to keep the rats coming.\n\n` +
-              `ratfacts.app`
-            );
-            victim.active = false;
-            victim.daysSent += 1;
-          }
-          continue;
-        }
-
-        const result = await sendRatFact(victim);
-        if (result.success) {
-          victim.factIndex += 1;
+      // Check free tier limit
+      if (!isDonor && victim.daysSent >= FREE_DAYS_LIMIT) {
+        if (victim.daysSent === FREE_DAYS_LIMIT) {
+          await sendSms(victim.phone,
+            `🐀 Your daily rat facts have paused after ${FREE_DAYS_LIMIT} days.\n\n` +
+            `The person who enrolled you needs to donate $1 to keep the rats coming.\n\n` +
+            `ratfacts.app`
+          );
+          victim.active = false;
           victim.daysSent += 1;
-          victim.lastSentAt = new Date().toISOString();
-          if (!victim.factHistory) victim.factHistory = [];
-          victim.factHistory.push(result.fact);
         }
+        continue;
+      }
+
+      const result = await sendRatFact(victim);
+      if (result.success) {
+        victim.factIndex += 1;
+        victim.daysSent += 1;
+        victim.lastSentAt = new Date().toISOString();
+        if (!victim.factHistory) victim.factHistory = [];
+        victim.factHistory.push(result.fact);
       }
     } catch (err) {
-      console.error(`[CRON] Error for ${victim.phone}:`, err.message);
+      console.error(`[CRON 09:00] Error for ${victim.phone}:`, err.message);
     }
   }
 
+  // Morning worm facts
+  await processWormVictims(all);
+
   saveVictims(all);
-  console.log(`[CRON] Done. Processed ${all.length} victims.`);
 
   // Cleanup expired magic links
   const links = loadLinks();
   saveLinks(links.filter(l => new Date(l.expiresAt) > new Date() || l.used));
+
+  console.log(`[CRON 09:00] Done.`);
+});
+
+// ─── CRON: 15:00 — afternoon rat facts (donors) + worm facts ─────────────────
+cron.schedule("0 15 * * *", async () => {
+  console.log("[CRON 15:00] Starting afternoon send...");
+  const all = loadVictims();
+  const users = loadUsers();
+
+  for (const victim of all) {
+    if (victim.wormMode || !victim.active) continue;
+    try {
+      const user = users.find(u => u.id === victim.userId);
+      if (!user?.isDonor) continue; // afternoon rat facts are donor-only
+
+      const result = await sendRatFact(victim);
+      if (result.success) {
+        victim.factIndex += 1;
+        victim.lastSentAt = new Date().toISOString();
+        if (!victim.factHistory) victim.factHistory = [];
+        victim.factHistory.push(result.fact);
+      }
+    } catch (err) {
+      console.error(`[CRON 15:00] Error for ${victim.phone}:`, err.message);
+    }
+  }
+
+  // Afternoon worm facts (all worm victims regardless of donor)
+  await processWormVictims(all);
+
+  saveVictims(all);
+  console.log(`[CRON 15:00] Done.`);
 });
 
 // ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
