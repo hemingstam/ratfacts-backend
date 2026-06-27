@@ -186,7 +186,7 @@ async function sendWormFact(victim) {
 
 // ─── EMAIL MAGIC LINK ─────────────────────────────────────────────────────────
 async function sendMagicLink(email, token) {
-  const link = `${APP_URL}/auth/verify?token=${token}`;
+  const link = `${APP_URL}?token=${token}`;
   try {
     await resend.emails.send({
       from: process.env.RESEND_FROM_EMAIL || "ratfacts@resend.dev",
